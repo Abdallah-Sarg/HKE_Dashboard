@@ -1,0 +1,867 @@
+﻿const express = require('express');
+const db = require('../lib/db');
+
+const DEFAULT_BOT_MESSAGES = {
+  welcome_message: 'Welcome {member}!',
+  goodbye_message: 'Goodbye {member}',
+  levelup_message: 'Congrats {user}, you reached level {level}!',
+  reaction_role_dm_message: 'You got the role **{role}** in **{server}**.',
+};
+
+function toFlag(v) {
+  return v ? 1 : 0;
+}
+
+function parseIntSafe(v, fallback = 0) {
+  const parsed = Number.parseInt(v, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseRoleIds(csv) {
+  return String(csv || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+function parseResponses(row) {
+  if (row.responses_json) {
+    try {
+      const parsed = JSON.parse(row.responses_json);
+      if (Array.isArray(parsed)) {
+        const out = parsed.map(x => String(x || '').trim()).filter(Boolean);
+        if (out.length) return out;
+      }
+    } catch (_) {}
+  }
+  return String(row.response || '').split('||').map(x => x.trim()).filter(Boolean);
+}
+
+function normalizeAutoReplyPayload(payload) {
+  const trigger = String(payload?.trigger || '').trim();
+  const response = String(payload?.response || '').trim();
+  const responses = Array.isArray(payload?.responses)
+    ? payload.responses.map(x => String(x || '').trim()).filter(Boolean)
+    : String(payload?.responsesText || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const allowed = Array.isArray(payload?.allowed_role_ids)
+    ? payload.allowed_role_ids.map(String).map(x => x.trim()).filter(Boolean)
+    : parseRoleIds(payload?.allowed_role_ids);
+  const similarity = Math.max(50, Math.min(100, parseIntSafe(payload?.similarity_threshold, 85)));
+
+  return {
+    trigger,
+    response: response || responses[0] || '',
+    responses_json: responses.length ? JSON.stringify(responses) : null,
+    allowed_role_ids: allowed.join(',') || null,
+    fuzzy_enabled: toFlag(payload?.fuzzy_enabled),
+    similarity_threshold: similarity,
+    enabled: payload?.enabled === 0 ? 0 : 1,
+  };
+}
+
+async function getBotMessages(guildId) {
+  const rows = await db.all(
+    'SELECT message_key, message_text FROM bot_messages WHERE guild_id = ? ORDER BY message_key ASC',
+    [guildId]
+  );
+  const out = { ...DEFAULT_BOT_MESSAGES };
+  for (const row of rows) out[row.message_key] = row.message_text;
+  return out;
+}
+
+function authMiddleware(token) {
+  return (req, res, next) => {
+    const provided = req.headers['x-dashboard-token'] || req.query.token || '';
+    if (token && provided !== token) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    return next();
+  };
+}
+
+function buildDashboardHtml() {
+  return `<!doctype html><html lang="ar" dir="rtl"><head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ù„ÙˆØ­Ø© ØªØ­ÙƒÙ… HKE</title>
+  <style>
+    :root{
+      --bg:#0b1220;--bg2:#111827;--panel:#0f172a;--line:#263247;--line2:#334155;
+      --txt:#f8fafc;--muted:#94a3b8;--accent:#38bdf8;--ok:#22c55e;--warn:#f59e0b;
+    }
+    *{box-sizing:border-box}
+    body{
+      font-family:Segoe UI,Arial;
+      background:
+        radial-gradient(1200px 500px at 0% -10%, #0b3b7a 0%, transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, #0b6c8a 0%, transparent 60%),
+        var(--bg);
+      color:var(--txt);margin:0
+    }
+    .w{padding:18px;max-width:1320px;margin:auto}
+    h2{margin:0 0 8px 0;letter-spacing:.3px}
+    .c{
+      border:1px solid var(--line2);
+      background:linear-gradient(180deg, rgba(17,24,39,.95), rgba(11,18,32,.95));
+      border-radius:14px;padding:14px;margin:12px 0;
+      box-shadow:0 10px 28px rgba(0,0,0,.22)
+    }
+    .c h3{
+      margin:0 0 12px 0;font-size:16px;
+      border-left:3px solid var(--accent);padding-left:10px
+    }
+    .r{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .r > input,.r > select{flex:1 1 220px;min-width:180px}
+    .m{color:var(--muted);font-size:12px}
+    label{display:block;margin:8px 0 6px;color:#cbd5e1;font-size:12px}
+    input,textarea,select,button{
+      background:var(--panel);color:var(--txt);border:1px solid var(--line);
+      border-radius:10px;padding:9px 10px;outline:none
+    }
+    input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(56,189,248,.18)}
+    textarea{width:100%;min-height:88px;resize:vertical}
+    select[multiple]{min-height:140px}
+    button{cursor:pointer;font-weight:600;transition:.18s}
+    button:hover{transform:translateY(-1px);border-color:var(--accent)}
+    #saveSettings,#saveMsgs,#saveReply,#addBlack,#setRoleLevel,#creditSet,#creditAdd,#creditRefresh{
+      background:linear-gradient(180deg, #0f2f4a, #12324d);
+      border-color:#1f516b
+    }
+    #guild{width:100%;font-weight:600}
+    table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+    th,td{border-bottom:1px solid var(--line);padding:9px 8px;text-align:left;vertical-align:top}
+    th{background:#0b1423;color:#cbd5e1;font-size:12px;letter-spacing:.2px}
+    tr:nth-child(even) td{background:rgba(148,163,184,.04)}
+    code{background:#0b1423;border:1px solid var(--line);border-radius:6px;padding:2px 6px}
+    .roles-checklist{
+      border:1px solid var(--line);
+      border-radius:10px;
+      padding:8px;
+      max-height:180px;
+      overflow:auto;
+      background:rgba(11,20,35,.55)
+    }
+    .role-check{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      padding:6px 4px;
+      border-radius:8px;
+      cursor:pointer
+    }
+    .role-check:hover{background:rgba(148,163,184,.08)}
+    .role-check input{width:auto;margin:0}
+    .role-check .rid{color:var(--muted);font-size:11px}
+    .settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+    .settings-field{display:flex;flex-direction:column;gap:6px}
+    .settings-field label{margin:0;font-size:12px;color:#cbd5e1}
+    .settings-field input,.settings-field select{width:100%}
+    .settings-actions{grid-column:1 / -1;display:flex;justify-content:flex-start}
+    .settings-head-note{display:none}
+    @media (max-width: 760px){
+      .w{padding:12px}
+      .c{padding:12px}
+      .r > input,.r > select{flex:1 1 100%}
+      .settings-grid{grid-template-columns:1fr}
+    }
+  </style></head><body><div class="w">
+  <h2>Ù„ÙˆØ­Ø© ØªØ­ÙƒÙ… HKE</h2><div id="status" class="m">Ø¬Ø§Ø±ÙŠ Ø§Ù„ØªØ­Ù…ÙŠÙ„...</div>
+  <div class="c"><label>Ø§Ù„Ø³ÙŠØ±ÙØ±</label><div class="m">Ø§Ø®ØªØ± Ø§Ù„Ø³ÙŠØ±ÙØ± Ø§Ù„Ø°ÙŠ ØªØ±ÙŠØ¯ ØªØ¹Ø¯ÙŠÙ„ Ø¥Ø¹Ø¯Ø§Ø¯Ø§ØªÙ‡.</div><select id="guild"></select></div>
+  <div class="c">
+    <h3>Ø§Ù„Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§Ù„Ø£Ø³Ø§Ø³ÙŠØ©</h3><div class="m">Ø§ÙƒØªØ¨ ID Ø§Ù„Ù‚Ù†ÙˆØ§Øª/Ø§Ù„Ø±ØªØ¨ Ø§Ù„Ù…Ø·Ù„ÙˆØ¨Ø© Ù„ØªÙØ¹ÙŠÙ„ Ù…ÙŠØ²Ø§Øª Ø§Ù„Ø¨ÙˆØª ÙÙŠ Ø§Ù„Ø³ÙŠØ±ÙØ±.</div>
+    <div class="m" style="margin:8px 0 10px 0;line-height:1.7">
+      welcome_channel_id: Ù‚Ù†Ø§Ø© Ø±Ø³Ø§Ù„Ø© Ø§Ù„ØªØ±Ø­ÙŠØ¨.<br>
+      goodbye_channel_id: Ù‚Ù†Ø§Ø© Ø±Ø³Ø§Ù„Ø© Ø§Ù„Ù…ØºØ§Ø¯Ø±Ø©.<br>
+      levelup_channel_id: Ù‚Ù†Ø§Ø© Ø¥Ø¹Ù„Ø§Ù† Ø±ÙØ¹ Ø§Ù„Ù„ÙŠÙÙ„.<br>
+      cmd_channel_id / cmd_admin_channel_id: Ù‚Ù†ÙˆØ§Øª ØªÙ†ÙÙŠØ° Ø§Ù„Ø£ÙˆØ§Ù…Ø±.<br>
+      muted_role_id: Ø§Ù„Ø±ØªØ¨Ø© Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù…Ø© Ù„Ù„Ù…ÙŠÙˆØª.<br>
+      log_*_channel_id: Ù‚Ù†ÙˆØ§Øª Ø§Ù„Ù„ÙˆÙ‚Ø§Øª Ø§Ù„Ù…Ø®ØªÙ„ÙØ©.
+    </div>
+    <div class="r">
+      <input id="welcome_channel_id" placeholder="ID Ù‚Ù†Ø§Ø© Ø§Ù„ØªØ±Ø­ÙŠØ¨" />
+      <input id="goodbye_channel_id" placeholder="ID Ù‚Ù†Ø§Ø© Ø§Ù„Ù…ØºØ§Ø¯Ø±Ø©" />
+      <input id="levelup_channel_id" placeholder="ID Ù‚Ù†Ø§Ø© Ø§Ù„Ù„ÙŠÙÙ„" />
+      <input id="cmd_channel_id" placeholder="ID Ù‚Ù†Ø§Ø© Ø§Ù„Ø£ÙˆØ§Ù…Ø±" />
+      <input id="cmd_admin_channel_id" placeholder="ID Ù‚Ù†Ø§Ø© Ø£ÙˆØ§Ù…Ø± Ø§Ù„Ø¥Ø¯Ø§Ø±Ø©" />
+      <input id="muted_role_id" placeholder="ID Ø±ØªØ¨Ø© Ø§Ù„Ù…ÙŠÙˆØª" />
+      <input id="ticket_category_id" placeholder="ID ÙƒØ§ØªÙŠØ¬ÙˆØ±ÙŠ Ø§Ù„ØªØ°Ø§ÙƒØ±" />
+    </div><div class="r">
+      <input id="log_roles_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø§Ù„Ø±ØªØ¨" />
+      <input id="log_rooms_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø§Ù„Ø±ÙˆÙ…Ø§Øª" />
+      <input id="log_bans_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø§Ù„Ø¨Ø§Ù†Ø¯" />
+      <input id="log_time_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø§Ù„ØªØ§ÙŠÙ…" />
+      <input id="log_kick_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø§Ù„ÙƒÙŠÙƒ" />
+      <input id="log_message_edit_channel_id" placeholder="ID Ù„ÙˆÙ‚ ØªØ¹Ø¯ÙŠÙ„ Ø§Ù„Ø±Ø³Ø§Ø¦Ù„" />
+      <input id="log_message_delete_channel_id" placeholder="ID Ù„ÙˆÙ‚ Ø­Ø°Ù Ø§Ù„Ø±Ø³Ø§Ø¦Ù„" />
+    </div><div class="r">
+      <select id="stats_enabled"><option value="1">ØªÙØ¹ÙŠÙ„ Ø§Ù„Ø¥Ø­ØµØ§Ø¦ÙŠØ§Øª</option><option value="0">ØªØ¹Ø·ÙŠÙ„ Ø§Ù„Ø¥Ø­ØµØ§Ø¦ÙŠØ§Øª</option></select>
+      <select id="automod_spam_enabled"><option value="1">Ù…Ù†Ø¹ Ø§Ù„Ø³Ø¨Ø§Ù…: ØªØ´ØºÙŠÙ„</option><option value="0">Ù…Ù†Ø¹ Ø§Ù„Ø³Ø¨Ø§Ù…: Ø¥ÙŠÙ‚Ø§Ù</option></select>
+      <select id="automod_links_enabled"><option value="1">Ù…Ù†Ø¹ Ø§Ù„Ø±ÙˆØ§Ø¨Ø·: ØªØ´ØºÙŠÙ„</option><option value="0">Ù…Ù†Ø¹ Ø§Ù„Ø±ÙˆØ§Ø¨Ø·: Ø¥ÙŠÙ‚Ø§Ù</option></select>
+      <select id="automod_caps_enabled"><option value="1">Ù…Ù†Ø¹ Ø§Ù„Ø­Ø±ÙˆÙ Ø§Ù„ÙƒØ¨ÙŠØ±Ø©: ØªØ´ØºÙŠÙ„</option><option value="0">Ù…Ù†Ø¹ Ø§Ù„Ø­Ø±ÙˆÙ Ø§Ù„ÙƒØ¨ÙŠØ±Ø©: Ø¥ÙŠÙ‚Ø§Ù</option></select>
+      <input id="automod_warn_threshold" type="number" placeholder="Ø¹Ø¯Ø¯ Ø§Ù„ØªØ­Ø°ÙŠØ±Ø§Øª Ù‚Ø¨Ù„ Ø§Ù„Ø¥Ø¬Ø±Ø§Ø¡" />
+      <button id="saveSettings">Ø­ÙØ¸ Ø§Ù„Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª</button>
+    </div>
+  </div>
+
+  <div class="c">
+    <h3>Ø±Ø³Ø§Ø¦Ù„ Ø§Ù„Ø¨ÙˆØª</h3><div class="m">Ø§ÙƒØªØ¨ Ø§Ù„Ø±Ø³Ø§Ø¦Ù„ Ø§Ù„ØªÙŠ ÙŠØ±Ø³Ù„Ù‡Ø§ Ø§Ù„Ø¨ÙˆØª. Ø§Ù„Ù…ØªØºÙŠØ±Ø§Øª Ø§Ù„Ù…ØªØ§Ø­Ø©: {user} {member} {server} {level} {role}</div>
+    <label>Ø±Ø³Ø§Ù„Ø© Ø§Ù„ØªØ±Ø­ÙŠØ¨ (ØªÙØ±Ø³Ù„ Ø¹Ù†Ø¯ Ø¯Ø®ÙˆÙ„ Ø¹Ø¶Ùˆ)</label><textarea id="msg_welcome_message"></textarea>
+    <label>Ø±Ø³Ø§Ù„Ø© Ø§Ù„Ù…ØºØ§Ø¯Ø±Ø© (ØªÙØ±Ø³Ù„ Ø¹Ù†Ø¯ Ø®Ø±ÙˆØ¬ Ø¹Ø¶Ùˆ)</label><textarea id="msg_goodbye_message"></textarea>
+    <label>Ø±Ø³Ø§Ù„Ø© Ø±ÙØ¹ Ø§Ù„Ù„ÙŠÙÙ„ (ØªÙØ±Ø³Ù„ Ø¹Ù†Ø¯ Ø²ÙŠØ§Ø¯Ø© Ù…Ø³ØªÙˆÙ‰ Ø¹Ø¶Ùˆ)</label><textarea id="msg_levelup_message"></textarea>
+    <label>Ø±Ø³Ø§Ù„Ø© Ø§Ù„Ø®Ø§Øµ Ù„Ù„Ø±ØªØ¨Ø© Ø§Ù„ØªÙØ§Ø¹Ù„ÙŠØ© (ØªÙØ±Ø³Ù„ ÙÙŠ DM Ø¹Ù†Ø¯ Ø£Ø®Ø° Ø±ØªØ¨Ø© ØªÙØ§Ø¹Ù„ÙŠØ©)</label><textarea id="msg_reaction_role_dm_message"></textarea>
+    <button id="saveMsgs">Ø­ÙØ¸ Ø§Ù„Ø±Ø³Ø§Ø¦Ù„</button>
+  </div>
+
+  <div class="c"><h3>Ø±ØªØ¨ Ø§Ù„Ø³ÙŠØ±ÙØ±</h3>
+    <div class="r" style="margin-bottom:8px;">
+      <button id="toggleRoles">Ø¥Ø®ÙØ§Ø¡ Ø§Ù„Ø±ØªØ¨</button>
+      <span id="rolesCount" class="m"></span>
+    </div>
+    <div id="rolesWrap">
+      <table><thead><tr><th>Ø§Ø³Ù… Ø§Ù„Ø±ØªØ¨Ø©</th><th>ID</th><th>Ø§Ù„ØªØ±ØªÙŠØ¨</th></tr></thead><tbody id="roles"></tbody></table>
+    </div>
+  </div>
+
+  <div class="c">
+    <h3>Ø§Ù„Ø±Ø¯ÙˆØ¯ Ø§Ù„ØªÙ„Ù‚Ø§Ø¦ÙŠØ©</h3><div class="m">Ø£Ù†Ø´Ø¦ Ø±Ø¯ÙˆØ¯ ØªÙ„Ù‚Ø§Ø¦ÙŠØ© Ø­Ø³Ø¨ ÙƒÙ„Ù…Ø©/Ø¬Ù…Ù„Ø©. ÙŠÙ…ÙƒÙ†Ùƒ ØªØ­Ø¯ÙŠØ¯ Ø±ØªØ¨ Ù…Ø¹ÙŠÙ†Ø© ÙÙ‚Ø· Ù„ØªÙØ¹ÙŠÙ„ Ø§Ù„Ø±Ø¯ Ù„Ù‡Ø§.</div><div class="r">
+      <input id="reply_trigger" placeholder="Ù†Øµ Ø§Ù„ØªØ±ÙŠØ¬Ø± (Trigger)" />
+      <select id="reply_enabled"><option value="1">Ø§Ù„Ø±Ø¯ Ù…ÙØ¹Ù„</option><option value="0">Ø§Ù„Ø±Ø¯ Ù…Ø¹Ø·Ù„</option></select>
+      <select id="reply_fuzzy_enabled"><option value="0">Ø§Ù„Ù…Ø·Ø§Ø¨Ù‚Ø© Ø§Ù„ØªÙ‚Ø±ÙŠØ¨ÙŠØ©: Ø¥ÙŠÙ‚Ø§Ù</option><option value="1">Ø§Ù„Ù…Ø·Ø§Ø¨Ù‚Ø© Ø§Ù„ØªÙ‚Ø±ÙŠØ¨ÙŠØ©: ØªØ´ØºÙŠÙ„</option></select>
+      <input id="reply_similarity_threshold" type="number" min="50" max="100" value="85" placeholder="Ù†Ø³Ø¨Ø© Ø§Ù„ØªØ´Ø§Ø¨Ù‡ (50-100)" />
+    </div>
+    <label>Ù†ØµÙˆØµ Ø§Ù„Ø±Ø¯ (ÙƒÙ„ Ø³Ø·Ø± = Ø±Ø¯ØŒ ÙˆØ§Ù„Ø¨ÙˆØª ÙŠØ®ØªØ§Ø± Ø¹Ø´ÙˆØ§Ø¦ÙŠÙ‹Ø§)</label><textarea id="reply_responses"></textarea>
+    <label>Ø§Ù„Ø±ØªØ¨ Ø§Ù„Ù…Ø³Ù…ÙˆØ­ Ù„Ù‡Ø§ Ø¨Ù‡Ø°Ø§ Ø§Ù„Ø±Ø¯ (Ù„Ùˆ Ø¨Ø¯ÙˆÙ† Ø§Ø®ØªÙŠØ§Ø± = ÙƒÙ„ Ø§Ù„Ø£Ø¹Ø¶Ø§Ø¡)</label><div id="reply_roles" class="roles-checklist"></div>
+    <div class="r"><button id="saveReply">Ø­ÙØ¸ Ø§Ù„Ø±Ø¯</button><button id="clearEdit">Ø¥Ù„ØºØ§Ø¡ Ø§Ù„ØªØ¹Ø¯ÙŠÙ„</button><button id="refreshReplies">ØªØ­Ø¯ÙŠØ« Ø§Ù„Ù‚Ø§Ø¦Ù…Ø©</button></div>
+    <div id="editState" class="m">Ø§Ù„ÙˆØ¶Ø¹ Ø§Ù„Ø­Ø§Ù„ÙŠ: Ø¥Ù†Ø´Ø§Ø¡ Ø±Ø¯ Ø¬Ø¯ÙŠØ¯</div>
+    <table><thead><tr><th>Ø§Ù„ØªØ±ÙŠØ¬Ø±</th><th>Ø§Ù„Ø±Ø¯ÙˆØ¯</th><th>Ø§Ù„Ù‚ÙˆØ§Ø¹Ø¯</th><th>Ø§Ù„Ø¥Ø¬Ø±Ø§Ø¡</th></tr></thead><tbody id="replies"></tbody></table>
+  </div>
+
+  <div class="c">
+    <h3>Ù‚Ø§Ø¦Ù…Ø© Ø§Ù„ÙƒÙ„Ù…Ø§Øª Ø§Ù„Ù…Ù…Ù†ÙˆØ¹Ø©</h3><div class="m">Ø£ÙŠ ÙƒÙ„Ù…Ø© Ù‡Ù†Ø§ ØªØ¹ØªØ¨Ø± ÙƒÙ„Ù…Ø© Ù…Ù…Ù†ÙˆØ¹Ø© Ø¶Ù…Ù† Ù†Ø¸Ø§Ù… Ø§Ù„Ø­Ù…Ø§ÙŠØ©.</div>
+    <div class="r"><input id="black_word" placeholder="Ø§ÙƒØªØ¨ ÙƒÙ„Ù…Ø© Ù„Ø¥Ø¶Ø§ÙØªÙ‡Ø§ Ù„Ù„Ø­Ø¸Ø±" /><button id="addBlack">Ø¥Ø¶Ø§ÙØ©</button></div>
+    <div id="blackListBox" class="m"></div>
+  </div>
+
+  <div class="c">
+    <h3>Ø±ØªØ¨ Ø§Ù„Ù„ÙŠÙÙ„</h3><div class="m">Ø§Ø±Ø¨Ø· Ù…Ø³ØªÙˆÙ‰ Ù…Ø¹ÙŠÙ† Ø¨Ø±ØªØ¨Ø©: Ø¹Ù†Ø¯ Ø§Ù„ÙˆØµÙˆÙ„ Ù„Ù„Ù…Ø³ØªÙˆÙ‰ØŒ ÙŠØ­ØµÙ„ Ø§Ù„Ø¹Ø¶Ùˆ Ø¹Ù„Ù‰ Ø§Ù„Ø±ØªØ¨Ø© ØªÙ„Ù‚Ø§Ø¦ÙŠÙ‹Ø§.</div>
+    <div class="r">
+      <input id="role_level_value" type="number" placeholder="Ø§Ù„Ù…Ø³ØªÙˆÙ‰" />
+      <select id="role_level_role"></select>
+      <button id="setRoleLevel">Ø­ÙØ¸ Ø§Ù„Ø±Ø¨Ø·</button>
+    </div>
+    <div id="roleLevelsBox" class="m"></div>
+  </div>
+
+  <div class="c">
+    <h3>Ø¥Ø¯Ø§Ø±Ø© Ø§Ù„ÙƒØ±ÙŠØ¯ÙŠØª</h3><div class="m">ØªØ¹Ø¯ÙŠÙ„ Ø±ØµÙŠØ¯ Ø¹Ø¶Ùˆ Ù…Ø¹ÙŠÙ† Ø£Ùˆ Ø¥Ø¶Ø§ÙØ©/Ø®ØµÙ… Ù…Ø¨Ù„Øº Ù…Ù† Ø±ØµÙŠØ¯Ù‡.</div>
+    <div class="m" style="margin:8px 0 10px 0;line-height:1.7">
+      ID Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù…: Ø§ÙƒØªØ¨ Ù…Ø¹Ø±Ù Ø§Ù„Ø´Ø®Øµ Ø§Ù„Ù…Ø±Ø§Ø¯ ØªØ¹Ø¯ÙŠÙ„ Ø±ØµÙŠØ¯Ù‡.<br>
+      ØªØ¹ÙŠÙŠÙ† Ø§Ù„Ø±ØµÙŠØ¯: ÙŠØ¶Ø¨Ø· Ø§Ù„Ø±ØµÙŠØ¯ Ø§Ù„Ù†Ù‡Ø§Ø¦ÙŠ Ø¹Ù„Ù‰ Ø§Ù„Ø±Ù‚Ù… Ø§Ù„Ù…ÙƒØªÙˆØ¨.<br>
+      Ø¥Ø¶Ø§ÙØ©/Ø®ØµÙ…: ÙŠØ²ÙŠØ¯ Ø£Ùˆ ÙŠÙ†Ù‚Øµ Ù…Ù† Ø§Ù„Ø±ØµÙŠØ¯ Ø§Ù„Ø­Ø§Ù„ÙŠ (Ø¨Ø§Ù„Ù‚ÙŠÙ…Ø© Ø§Ù„Ù…ÙˆØ¬Ø¨Ø©/Ø§Ù„Ø³Ø§Ù„Ø¨Ø©).
+    </div>
+    <div class="r">
+      <input id="credit_user" placeholder="ID Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù…" />
+      <input id="credit_amount" type="number" placeholder="Ø§Ù„Ù…Ø¨Ù„Øº" />
+      <button id="creditSet">ØªØ¹ÙŠÙŠÙ† Ø§Ù„Ø±ØµÙŠØ¯</button>
+      <button id="creditAdd">Ø¥Ø¶Ø§ÙØ©/Ø®ØµÙ…</button>
+      <button id="creditRefresh">ØªØ­Ø¯ÙŠØ«</button>
+    </div>
+    <table><thead><tr><th>#</th><th>Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù…</th><th>Ø§Ù„Ø±ØµÙŠØ¯</th></tr></thead><tbody id="creditRows"></tbody></table>
+  </div>
+
+  <script>
+    const token = new URLSearchParams(location.search).get('token') || '';
+    const q = id => document.getElementById(id);
+    let guildId = null; let editingReplyId = null;
+    const MSG_KEYS = ['welcome_message','goodbye_message','levelup_message','reaction_role_dm_message'];
+    const SETTINGS_FIELDS = [
+      ['welcome_channel_id', 'Ù…Ø¹Ø±Ù Ù‚Ù†Ø§Ø© Ø§Ù„ØªØ±Ø­ÙŠØ¨'],
+      ['goodbye_channel_id', 'Ù…Ø¹Ø±Ù Ù‚Ù†Ø§Ø© Ø§Ù„Ù…ØºØ§Ø¯Ø±Ø©'],
+      ['levelup_channel_id', 'Ù…Ø¹Ø±Ù Ù‚Ù†Ø§Ø© Ø§Ù„Ù„ÙŠÙÙ„'],
+      ['cmd_channel_id', 'Ù…Ø¹Ø±Ù Ù‚Ù†Ø§Ø© Ø§Ù„Ø£ÙˆØ§Ù…Ø±'],
+      ['cmd_admin_channel_id', 'Ù…Ø¹Ø±Ù Ù‚Ù†Ø§Ø© Ø£ÙˆØ§Ù…Ø± Ø§Ù„Ø¥Ø¯Ø§Ø±Ø©'],
+      ['muted_role_id', 'Ù…Ø¹Ø±Ù Ø±ØªØ¨Ø© Ø§Ù„Ù…ÙŠÙˆØª'],
+      ['ticket_category_id', 'Ù…Ø¹Ø±Ù ÙƒØ§ØªÙŠØ¬ÙˆØ±ÙŠ Ø§Ù„ØªØ°Ø§ÙƒØ±'],
+      ['stats_enabled', 'ØªÙØ¹ÙŠÙ„ Ø§Ù„Ø¥Ø­ØµØ§Ø¦ÙŠØ§Øª'],
+      ['automod_warn_threshold', 'Ø­Ø¯ Ø§Ù„ØªØ­Ø°ÙŠØ±Ø§Øª'],
+      ['log_roles_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø§Ù„Ø±ØªØ¨'],
+      ['log_rooms_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø§Ù„Ø±ÙˆÙ…Ø§Øª'],
+      ['log_bans_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø§Ù„Ø¨Ø§Ù†Ø¯'],
+      ['log_time_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø§Ù„ØªØ§ÙŠÙ…'],
+      ['log_kick_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø§Ù„ÙƒÙŠÙƒ'],
+      ['log_message_edit_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ ØªØ¹Ø¯ÙŠÙ„ Ø§Ù„Ø±Ø³Ø§Ø¦Ù„'],
+      ['log_message_delete_channel_id', 'Ù…Ø¹Ø±Ù Ù„ÙˆÙ‚ Ø­Ø°Ù Ø§Ù„Ø±Ø³Ø§Ø¦Ù„'],
+      ['automod_spam_enabled', 'Ù…Ù†Ø¹ Ø§Ù„Ø³Ø¨Ø§Ù…'],
+      ['automod_links_enabled', 'Ù…Ù†Ø¹ Ø§Ù„Ø±ÙˆØ§Ø¨Ø·'],
+      ['automod_caps_enabled', 'Ù…Ù†Ø¹ Ø§Ù„Ø­Ø±ÙˆÙ Ø§Ù„ÙƒØ¨ÙŠØ±Ø©'],
+    ];
+    function status(t,e){q('status').textContent=t;q('status').style.color=e?'#fca5a5':'#94a3b8';}
+    function responsesFromText(t){return String(t||'').split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);}
+    function selectedValues(el){
+      if (!el) return [];
+      if (el.tagName === 'SELECT') {
+        return Array.from(el.selectedOptions || []).map(o => o.value);
+      }
+      return Array.from(el.querySelectorAll('input[type="checkbox"][data-role-id]:checked'))
+        .map(input => input.getAttribute('data-role-id'));
+    }
+    function initSettingsLayout(){
+      const firstField = q('welcome_channel_id');
+      if(!firstField) return;
+      const card = firstField.closest('.c');
+      if(!card || card.querySelector('.settings-grid')) return;
+
+      const headNotes = Array.from(card.querySelectorAll(':scope > .m'));
+      headNotes.forEach(note => note.classList.add('settings-head-note'));
+      const oldRows = Array.from(card.querySelectorAll(':scope > .r'));
+      oldRows.forEach(row => { row.style.display = 'none'; });
+
+      const grid = document.createElement('div');
+      grid.className = 'settings-grid';
+
+      for (const [id, labelText] of SETTINGS_FIELDS) {
+        const input = q(id);
+        if (!input) continue;
+        input.placeholder = '';
+        const wrap = document.createElement('div');
+        wrap.className = 'settings-field';
+        const label = document.createElement('label');
+        label.setAttribute('for', id);
+        label.textContent = labelText;
+        wrap.append(label, input);
+        grid.appendChild(wrap);
+      }
+
+      const saveBtn = q('saveSettings');
+      if (saveBtn) {
+        const action = document.createElement('div');
+        action.className = 'settings-actions';
+        action.appendChild(saveBtn);
+        grid.appendChild(action);
+      }
+
+      card.appendChild(grid);
+    }
+    async function api(path, options = {}) {
+      const u = new URL(path, location.origin); if(token) u.searchParams.set('token', token);
+      const r = await fetch(u.toString(), { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers||{}) } });
+      if(!r.ok){ throw new Error(await r.text() || ('HTTP '+r.status)); }
+      const ct = r.headers.get('content-type') || ''; return ct.includes('application/json') ? r.json() : r.text();
+    }
+    function fillSettings(s){
+      const keys=['welcome_channel_id','goodbye_channel_id','levelup_channel_id','cmd_channel_id','cmd_admin_channel_id','muted_role_id','ticket_category_id','log_roles_channel_id','log_rooms_channel_id','log_bans_channel_id','log_time_channel_id','log_kick_channel_id','log_message_edit_channel_id','log_message_delete_channel_id','stats_enabled','automod_spam_enabled','automod_links_enabled','automod_caps_enabled','automod_warn_threshold'];
+      for (const k of keys){ const el=q(k); if(el) el.value=String(s[k] ?? (k.includes('enabled')?'0':'')); }
+    }
+    function fillMessages(m){ for (const k of MSG_KEYS){ q('msg_'+k).value = m[k] || ''; } }
+    function drawRoles(roles){
+      q('roles').innerHTML = roles.length ? roles.map(r=>'<tr><td>'+r.name+'</td><td><code>'+r.id+'</code></td><td>'+r.position+'</td></tr>').join('') : '<tr><td colspan="3" class="m">Ù„Ø§ ØªÙˆØ¬Ø¯ Ø±ØªØ¨</td></tr>';
+      q('rolesCount').textContent = roles.length ? ('Ø¥Ø¬Ù…Ø§Ù„ÙŠ Ø§Ù„Ø±ØªØ¨: ' + roles.length) : 'Ù„Ø§ ØªÙˆØ¬Ø¯ Ø±ØªØ¨';
+      q('reply_roles').innerHTML = roles.length
+        ? roles.map(r =>
+            '<label class="role-check"><input type="checkbox" data-role-id="'+r.id+'" />' +
+            '<span>'+r.name+'</span><span class="rid">('+r.id+')</span></label>'
+          ).join('')
+        : '<div class="m">No roles available.</div>';
+      q('role_level_role').innerHTML = '<option value="">Ø§Ø®ØªØ± Ø±ØªØ¨Ø©</option>' + roles.map(r=>'<option value="'+r.id+'">'+r.name+' ('+r.id+')</option>').join('');
+    }
+    function drawBlacklist(words){
+      q('blackListBox').innerHTML = words.length
+        ? words.map(w=>'<span style="margin-right:8px;">'+w+' <button data-word="'+encodeURIComponent(w)+'">x</button></span>').join('')
+        : '<span class="m">Ù„Ø§ ØªÙˆØ¬Ø¯ ÙƒÙ„Ù…Ø§Øª</span>';
+      Array.from(q('blackListBox').querySelectorAll('button[data-word]')).forEach(btn => {
+        btn.onclick = () => removeBlack(decodeURIComponent(btn.getAttribute('data-word')));
+      });
+    }
+    function drawRoleLevels(items){
+      q('roleLevelsBox').innerHTML = items.length
+        ? items.map(it=>'<span style="margin-right:8px;">Ù…Ø³ØªÙˆÙ‰ '+it.level+' -> '+it.role_id+' <button data-lv="'+it.level+'">x</button></span>').join('')
+        : '<span class="m">Ù„Ø§ ØªÙˆØ¬Ø¯ Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª</span>';
+      Array.from(q('roleLevelsBox').querySelectorAll('button[data-lv]')).forEach(btn => {
+        btn.onclick = () => removeRoleLevel(btn.getAttribute('data-lv'));
+      });
+    }
+    function drawCredits(items){
+      q('creditRows').innerHTML = items.length
+        ? items.map((it, idx)=>'<tr><td>'+(idx+1)+'</td><td><@'+it.user_id+'></td><td>'+it.balance+'</td></tr>').join('')
+        : '<tr><td colspan="3" class="m">Ù„Ø§ ØªÙˆØ¬Ø¯ Ø¨ÙŠØ§Ù†Ø§Øª</td></tr>';
+    }
+    function resetReplyForm(){
+      editingReplyId=null; q('reply_trigger').value=''; q('reply_enabled').value='1'; q('reply_fuzzy_enabled').value='0'; q('reply_similarity_threshold').value='85'; q('reply_responses').value='';
+      Array.from(q('reply_roles').querySelectorAll('input[type="checkbox"][data-role-id]')).forEach(input => { input.checked = false; });
+      q('editState').textContent='Ø§Ù„ÙˆØ¶Ø¹ Ø§Ù„Ø­Ø§Ù„ÙŠ: Ø¥Ù†Ø´Ø§Ø¡ Ø±Ø¯ Ø¬Ø¯ÙŠØ¯';
+    }
+    function editReply(item){
+      editingReplyId=item.id; q('reply_trigger').value=item.trigger||''; q('reply_enabled').value=item.enabled?'1':'0'; q('reply_fuzzy_enabled').value=item.fuzzy_enabled?'1':'0'; q('reply_similarity_threshold').value=item.similarity_threshold||85;
+      q('reply_responses').value=(Array.isArray(item.responses)?item.responses:(item.response?[item.response]:[])).join('\\n');
+      const set = new Set(Array.isArray(item.allowed_role_ids)?item.allowed_role_ids:[]);
+      Array.from(q('reply_roles').querySelectorAll('input[type="checkbox"][data-role-id]')).forEach(input => {
+        input.checked = set.has(input.getAttribute('data-role-id'));
+      });
+      q('editState').textContent='Ø§Ù„ÙˆØ¶Ø¹ Ø§Ù„Ø­Ø§Ù„ÙŠ: ØªØ¹Ø¯ÙŠÙ„ Ø§Ù„Ø±Ø¯ #' + item.id;
+    }
+    function drawReplies(items){
+      const b=q('replies'); b.innerHTML=''; if(!items.length){ b.innerHTML='<tr><td colspan="4" class="m">Ù„Ø§ ØªÙˆØ¬Ø¯ Ø±Ø¯ÙˆØ¯</td></tr>'; return; }
+      for(const it of items){
+        const tr=document.createElement('tr'); const rs=Array.isArray(it.responses)?it.responses:(it.response?[it.response]:[]); const roles=Array.isArray(it.allowed_role_ids)?it.allowed_role_ids:[];
+        tr.innerHTML='<td><b>'+it.trigger+'</b></td><td>'+ (rs.length?rs.map(x=>'- '+x).join('<br>'):'(ÙØ§Ø±Øº)') +'</td><td>Ø§Ù„Ø­Ø§Ù„Ø©: '+(it.enabled?'Ù…ÙØ¹Ù„':'Ù…Ø¹Ø·Ù„')+'<br>ØªÙ‚Ø±ÙŠØ¨ÙŠ: '+(it.fuzzy_enabled?'ØªØ´ØºÙŠÙ„':'Ø¥ÙŠÙ‚Ø§Ù')+' ('+it.similarity_threshold+')<br>Ø§Ù„Ø±ØªØ¨: '+(roles.length?roles.join(', '):'Ø§Ù„ÙƒÙ„')+'</td><td><button data-e=\"1\">ØªØ¹Ø¯ÙŠÙ„</button> <button data-t=\"1\">ØªÙØ¹ÙŠÙ„/ØªØ¹Ø·ÙŠÙ„</button> <button data-d=\"1\">Ø­Ø°Ù</button></td>';
+        tr.querySelector('[data-e]').onclick=()=>editReply(it);
+        tr.querySelector('[data-t]').onclick=()=>toggleReply(it.id, it.enabled ? 0 : 1);
+        tr.querySelector('[data-d]').onclick=()=>deleteReply(it.id);
+        b.appendChild(tr);
+      }
+    }
+    async function loadGuilds(){
+      status('Ø¬Ø§Ø±ÙŠ ØªØ­Ù…ÙŠÙ„ Ø§Ù„Ø³ÙŠØ±ÙØ±Ø§Øª...'); const d=await api('/api/guilds'); const sel=q('guild'); sel.innerHTML='';
+      for(const g of (d.guilds||[])){ const op=document.createElement('option'); op.value=g.id; op.textContent=g.name+' ('+g.members+')'; sel.appendChild(op); }
+      if(!sel.value){ status('Ù„Ø§ ÙŠÙˆØ¬Ø¯ Ø³ÙŠØ±ÙØ±Ø§Øª'); return; } sel.onchange=()=>loadGuild(sel.value); await loadGuild(sel.value);
+    }
+    async function loadGuild(id){
+      guildId=id;
+      status('Ø¬Ø§Ø±ÙŠ ØªØ­Ù…ÙŠÙ„ Ø¨ÙŠØ§Ù†Ø§Øª Ø§Ù„Ø³ÙŠØ±ÙØ±...');
+      const d=await api('/api/guilds/'+id);
+      fillSettings(d.settings||{});
+      fillMessages(d.botMessages||{});
+      drawRoles(d.roles||[]);
+      drawReplies(d.autoReplies||[]);
+      drawBlacklist(d.blacklist||[]);
+      drawRoleLevels(d.roleLevels||[]);
+      resetReplyForm();
+      await loadCredits();
+      status('ØªÙ… ØªØ­Ù…ÙŠÙ„ Ø§Ù„Ø³ÙŠØ±ÙØ±: '+(d.guild?.name||id));
+    }
+    async function loadCredits(){ if(!guildId) return; const d = await api('/api/guilds/'+guildId+'/credits?limit=20'); drawCredits(d.items||[]); }
+    async function saveSettings(){
+      const p={}; for(const k of ['welcome_channel_id','goodbye_channel_id','levelup_channel_id','cmd_channel_id','cmd_admin_channel_id','muted_role_id','ticket_category_id','log_roles_channel_id','log_rooms_channel_id','log_bans_channel_id','log_time_channel_id','log_kick_channel_id','log_message_edit_channel_id','log_message_delete_channel_id']) p[k]=q(k).value.trim()||null;
+      for(const k of ['stats_enabled','automod_spam_enabled','automod_links_enabled','automod_caps_enabled','automod_warn_threshold']) p[k]=Number(q(k).value||0);
+      await api('/api/guilds/'+guildId+'/settings',{method:'PUT',body:JSON.stringify(p)}); status('ØªÙ… Ø­ÙØ¸ Ø§Ù„Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª');
+    }
+    async function saveMessages(){ const messages={}; for(const k of MSG_KEYS) messages[k]=q('msg_'+k).value.trim(); await api('/api/guilds/'+guildId+'/bot-messages',{method:'PUT',body:JSON.stringify({messages})}); status('ØªÙ… Ø­ÙØ¸ Ø§Ù„Ø±Ø³Ø§Ø¦Ù„'); }
+    async function saveReply(){
+      const responses = responsesFromText(q('reply_responses').value); const trigger=q('reply_trigger').value.trim(); if(!trigger||!responses.length) return;
+      const p={trigger,responses,response:responses[0],enabled:Number(q('reply_enabled').value),fuzzy_enabled:Number(q('reply_fuzzy_enabled').value),similarity_threshold:Number(q('reply_similarity_threshold').value||85),allowed_role_ids:selectedValues(q('reply_roles'))};
+      if(editingReplyId) await api('/api/guilds/'+guildId+'/auto-replies/'+editingReplyId,{method:'PUT',body:JSON.stringify(p)});
+      else await api('/api/guilds/'+guildId+'/auto-replies',{method:'POST',body:JSON.stringify(p)});
+      const d=await api('/api/guilds/'+guildId+'/auto-replies'); drawReplies(d.items||[]); resetReplyForm(); status('ØªÙ… Ø­ÙØ¸ Ø§Ù„Ø±Ø¯');
+    }
+    async function toggleReply(id,enabled){ await api('/api/guilds/'+guildId+'/auto-replies/'+id,{method:'PUT',body:JSON.stringify({enabled})}); const d=await api('/api/guilds/'+guildId+'/auto-replies'); drawReplies(d.items||[]); }
+    async function deleteReply(id){ await api('/api/guilds/'+guildId+'/auto-replies/'+id,{method:'DELETE'}); const d=await api('/api/guilds/'+guildId+'/auto-replies'); drawReplies(d.items||[]); if(editingReplyId===id) resetReplyForm(); }
+    async function addBlack(){
+      if(!guildId) return;
+      const word = q('black_word').value.trim();
+      if(!word) return;
+      await api('/api/guilds/'+guildId+'/blacklist',{method:'POST',body:JSON.stringify({word})});
+      q('black_word').value='';
+      const d=await api('/api/guilds/'+guildId);
+      drawBlacklist(d.blacklist||[]);
+    }
+    async function removeBlack(word){
+      if(!guildId) return;
+      await api('/api/guilds/'+guildId+'/blacklist/'+encodeURIComponent(word),{method:'DELETE'});
+      const d=await api('/api/guilds/'+guildId);
+      drawBlacklist(d.blacklist||[]);
+    }
+    async function setRoleLevelCmd(){
+      if(!guildId) return;
+      const level = Number(q('role_level_value').value);
+      const role_id = q('role_level_role').value.trim();
+      if(!level || !role_id) return;
+      await api('/api/guilds/'+guildId+'/role-levels',{method:'POST',body:JSON.stringify({level, role_id})});
+      q('role_level_value').value='';
+      const d=await api('/api/guilds/'+guildId);
+      drawRoleLevels(d.roleLevels||[]);
+    }
+    async function removeRoleLevel(level){
+      if(!guildId) return;
+      await api('/api/guilds/'+guildId+'/role-levels/'+level,{method:'DELETE'});
+      const d=await api('/api/guilds/'+guildId);
+      drawRoleLevels(d.roleLevels||[]);
+    }
+    async function setCredit(){
+      if(!guildId) return;
+      const user_id = q('credit_user').value.trim();
+      const balance = Number(q('credit_amount').value);
+      if(!user_id || !Number.isFinite(balance) || balance < 0) return;
+      await api('/api/guilds/'+guildId+'/credits/set',{method:'POST',body:JSON.stringify({user_id,balance})});
+      await loadCredits();
+    }
+    async function addCredit(){
+      if(!guildId) return;
+      const user_id = q('credit_user').value.trim();
+      const amount = Number(q('credit_amount').value);
+      if(!user_id || !Number.isFinite(amount)) return;
+      await api('/api/guilds/'+guildId+'/credits/add',{method:'POST',body:JSON.stringify({user_id,amount})});
+      await loadCredits();
+    }
+    q('saveSettings').onclick=()=>saveSettings().catch(e=>status(e.message,true));
+    q('saveMsgs').onclick=()=>saveMessages().catch(e=>status(e.message,true));
+    q('saveReply').onclick=()=>saveReply().catch(e=>status(e.message,true));
+    q('refreshReplies').onclick=()=>api('/api/guilds/'+guildId+'/auto-replies').then(d=>drawReplies(d.items||[])).catch(e=>status(e.message,true));
+    q('clearEdit').onclick=()=>resetReplyForm();
+    q('toggleRoles').onclick=()=>{
+      const wrap = q('rolesWrap');
+      const hidden = wrap.style.display === 'none';
+      wrap.style.display = hidden ? '' : 'none';
+      q('toggleRoles').textContent = hidden ? 'Ø¥Ø®ÙØ§Ø¡ Ø§Ù„Ø±ØªØ¨' : 'Ø¥Ø¸Ù‡Ø§Ø± Ø§Ù„Ø±ØªØ¨';
+    };
+    q('addBlack').onclick=()=>addBlack().catch(e=>status(e.message,true));
+    q('setRoleLevel').onclick=()=>setRoleLevelCmd().catch(e=>status(e.message,true));
+    q('creditSet').onclick=()=>setCredit().catch(e=>status(e.message,true));
+    q('creditAdd').onclick=()=>addCredit().catch(e=>status(e.message,true));
+    q('creditRefresh').onclick=()=>loadCredits().catch(e=>status(e.message,true));
+    initSettingsLayout();
+    loadGuilds().catch(e=>status(e.message,true));
+  </script>
+  </div></body></html>`;
+}
+
+async function getGuildDashboardData(client, guildId) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return null;
+
+  const settings = (await db.get('SELECT * FROM settings WHERE guild_id = ?', [guildId])) || {};
+  const autoReplyRows = await db.all(
+    `SELECT id, trigger, response, responses_json, allowed_role_ids, fuzzy_enabled, similarity_threshold, enabled
+     FROM auto_replies
+     WHERE guild_id = ?
+     ORDER BY id DESC`,
+    [guildId]
+  );
+  const autoReplies = autoReplyRows.map(row => ({
+    id: row.id,
+    trigger: row.trigger,
+    response: row.response,
+    responses: parseResponses(row),
+    allowed_role_ids: parseRoleIds(row.allowed_role_ids),
+    fuzzy_enabled: !!row.fuzzy_enabled,
+    similarity_threshold: row.similarity_threshold || 85,
+    enabled: !!row.enabled,
+  }));
+
+  const roles = guild.roles.cache
+    .filter(role => role.id !== guild.id)
+    .sort((a, b) => b.position - a.position)
+    .map(role => ({ id: role.id, name: role.name, position: role.position }));
+
+  const blacklistRows = await db.all(
+    'SELECT word FROM automod_blacklist WHERE guild_id = ? ORDER BY word ASC',
+    [guildId]
+  );
+  const roleLevels = await db.all(
+    'SELECT level, role_id FROM role_levels WHERE guild_id = ? ORDER BY level ASC',
+    [guildId]
+  );
+
+  return {
+    guild: { id: guild.id, name: guild.name, members: guild.memberCount },
+    settings,
+    autoReplies,
+    roles,
+    blacklist: blacklistRows.map(row => row.word),
+    roleLevels,
+    botMessages: await getBotMessages(guildId),
+  };
+}
+
+function startDashboard(client) {
+  const app = express();
+  const port = parseIntSafe(process.env.PORT || process.env.DASHBOARD_PORT, 3000);
+  const token = process.env.DASHBOARD_TOKEN || '';
+
+  app.use(express.json({ limit: '1mb' }));
+  app.use(authMiddleware(token));
+
+  app.get('/', (req, res) => res.type('html').send(buildDashboardHtml()));
+
+  app.get('/api/guilds', (req, res) => {
+    const guilds = [];
+    for (const guild of client.guilds.cache.values()) {
+      guilds.push({ id: guild.id, name: guild.name, members: guild.memberCount });
+    }
+    guilds.sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ guilds });
+  });
+
+  app.get('/api/guilds/:guildId', async (req, res) => {
+    const data = await getGuildDashboardData(client, req.params.guildId);
+    if (!data) return res.status(404).json({ error: 'guild_not_found' });
+    const guilds = [];
+    for (const guild of client.guilds.cache.values()) {
+      guilds.push({ id: guild.id, name: guild.name, members: guild.memberCount });
+    }
+    return res.json({ ...data, guilds });
+  });
+
+  app.put('/api/guilds/:guildId/settings', async (req, res) => {
+    const guildId = req.params.guildId;
+    if (!client.guilds.cache.has(guildId)) return res.status(404).json({ error: 'guild_not_found' });
+    const p = req.body || {};
+    await db.run(
+      `INSERT INTO settings (
+        guild_id, welcome_channel_id, goodbye_channel_id, levelup_channel_id, cmd_channel_id, cmd_admin_channel_id,
+        welcome_message, muted_role_id, ticket_category_id,
+        log_roles_channel_id, log_rooms_channel_id, log_bans_channel_id, log_time_channel_id, log_kick_channel_id,
+        log_message_edit_channel_id, log_message_delete_channel_id,
+        automod_spam_enabled, automod_links_enabled, automod_caps_enabled, automod_warn_threshold, stats_enabled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        welcome_channel_id = excluded.welcome_channel_id,
+        goodbye_channel_id = excluded.goodbye_channel_id,
+        levelup_channel_id = excluded.levelup_channel_id,
+        cmd_channel_id = excluded.cmd_channel_id,
+        cmd_admin_channel_id = excluded.cmd_admin_channel_id,
+        welcome_message = excluded.welcome_message,
+        muted_role_id = excluded.muted_role_id,
+        ticket_category_id = excluded.ticket_category_id,
+        log_roles_channel_id = excluded.log_roles_channel_id,
+        log_rooms_channel_id = excluded.log_rooms_channel_id,
+        log_bans_channel_id = excluded.log_bans_channel_id,
+        log_time_channel_id = excluded.log_time_channel_id,
+        log_kick_channel_id = excluded.log_kick_channel_id,
+        log_message_edit_channel_id = excluded.log_message_edit_channel_id,
+        log_message_delete_channel_id = excluded.log_message_delete_channel_id,
+        automod_spam_enabled = excluded.automod_spam_enabled,
+        automod_links_enabled = excluded.automod_links_enabled,
+        automod_caps_enabled = excluded.automod_caps_enabled,
+        automod_warn_threshold = excluded.automod_warn_threshold,
+        stats_enabled = excluded.stats_enabled`,
+      [
+        guildId,
+        p.welcome_channel_id || null,
+        p.goodbye_channel_id || null,
+        p.levelup_channel_id || null,
+        p.cmd_channel_id || null,
+        p.cmd_admin_channel_id || null,
+        p.welcome_message || null,
+        p.muted_role_id || null,
+        p.ticket_category_id || null,
+        p.log_roles_channel_id || null,
+        p.log_rooms_channel_id || null,
+        p.log_bans_channel_id || null,
+        p.log_time_channel_id || null,
+        p.log_kick_channel_id || null,
+        p.log_message_edit_channel_id || null,
+        p.log_message_delete_channel_id || null,
+        toFlag(p.automod_spam_enabled),
+        toFlag(p.automod_links_enabled),
+        toFlag(p.automod_caps_enabled),
+        parseIntSafe(p.automod_warn_threshold, 5),
+        toFlag(p.stats_enabled),
+      ]
+    );
+    return res.json({ ok: true });
+  });
+
+  app.get('/api/guilds/:guildId/bot-messages', async (req, res) => {
+    const guildId = req.params.guildId;
+    if (!client.guilds.cache.has(guildId)) return res.status(404).json({ error: 'guild_not_found' });
+    return res.json({ messages: await getBotMessages(guildId) });
+  });
+
+  app.put('/api/guilds/:guildId/bot-messages', async (req, res) => {
+    const guildId = req.params.guildId;
+    if (!client.guilds.cache.has(guildId)) return res.status(404).json({ error: 'guild_not_found' });
+    const messages = req.body?.messages || {};
+    for (const key of Object.keys(DEFAULT_BOT_MESSAGES)) {
+      const text = String(messages[key] || '').trim();
+      if (!text) continue;
+      await db.run(
+        `INSERT INTO bot_messages (guild_id, message_key, message_text, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(guild_id, message_key) DO UPDATE SET
+           message_text = excluded.message_text, updated_at = excluded.updated_at`,
+        [guildId, key, text, Math.floor(Date.now() / 1000)]
+      );
+    }
+    return res.json({ ok: true });
+  });
+
+  app.get('/api/guilds/:guildId/auto-replies', async (req, res) => {
+    const guildId = req.params.guildId;
+    const rows = await db.all(
+      `SELECT id, trigger, response, responses_json, allowed_role_ids, fuzzy_enabled, similarity_threshold, enabled
+       FROM auto_replies WHERE guild_id = ? ORDER BY id DESC`,
+      [guildId]
+    );
+    const items = rows.map(row => ({
+      id: row.id,
+      trigger: row.trigger,
+      response: row.response,
+      responses: parseResponses(row),
+      allowed_role_ids: parseRoleIds(row.allowed_role_ids),
+      fuzzy_enabled: !!row.fuzzy_enabled,
+      similarity_threshold: row.similarity_threshold || 85,
+      enabled: !!row.enabled,
+    }));
+    res.json({ items });
+  });
+
+  app.post('/api/guilds/:guildId/auto-replies', async (req, res) => {
+    const guildId = req.params.guildId;
+    const n = normalizeAutoReplyPayload(req.body || {});
+    if (!n.trigger || !n.response) return res.status(400).json({ error: 'trigger_and_response_required' });
+    await db.run(
+      `INSERT INTO auto_replies (
+        guild_id, trigger, response, responses_json, allowed_role_ids, fuzzy_enabled, similarity_threshold, enabled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, trigger) DO UPDATE SET
+        response = excluded.response,
+        responses_json = excluded.responses_json,
+        allowed_role_ids = excluded.allowed_role_ids,
+        fuzzy_enabled = excluded.fuzzy_enabled,
+        similarity_threshold = excluded.similarity_threshold,
+        enabled = excluded.enabled`,
+      [guildId, n.trigger, n.response, n.responses_json, n.allowed_role_ids, n.fuzzy_enabled, n.similarity_threshold, n.enabled]
+    );
+    res.json({ ok: true });
+  });
+
+  app.put('/api/guilds/:guildId/auto-replies/:id', async (req, res) => {
+    const guildId = req.params.guildId;
+    const id = parseIntSafe(req.params.id, 0);
+    if (!id) return res.status(400).json({ error: 'invalid_id' });
+    const existing = await db.get(
+      'SELECT id, trigger, response, responses_json, allowed_role_ids, fuzzy_enabled, similarity_threshold, enabled FROM auto_replies WHERE guild_id = ? AND id = ?',
+      [guildId, id]
+    );
+    if (!existing) return res.status(404).json({ error: 'not_found' });
+
+    const payload = req.body || {};
+    const toggleOnly = Object.keys(payload).length === 1 && Object.prototype.hasOwnProperty.call(payload, 'enabled');
+    if (toggleOnly) {
+      const enabled = payload.enabled === 1 ? 1 : 0;
+      await db.run('UPDATE auto_replies SET enabled = ? WHERE guild_id = ? AND id = ?', [enabled, guildId, id]);
+      return res.json({ ok: true });
+    }
+
+    const n = normalizeAutoReplyPayload({
+      trigger: payload.trigger ?? existing.trigger,
+      response: payload.response ?? existing.response,
+      responsesText: payload.responsesText,
+      responses: payload.responses,
+      allowed_role_ids: payload.allowed_role_ids ?? existing.allowed_role_ids,
+      fuzzy_enabled: payload.fuzzy_enabled ?? existing.fuzzy_enabled,
+      similarity_threshold: payload.similarity_threshold ?? existing.similarity_threshold,
+      enabled: payload.enabled ?? existing.enabled,
+    });
+
+    if (!n.trigger || !n.response) return res.status(400).json({ error: 'trigger_and_response_required' });
+    await db.run(
+      `UPDATE auto_replies
+       SET trigger = ?, response = ?, responses_json = ?, allowed_role_ids = ?, fuzzy_enabled = ?, similarity_threshold = ?, enabled = ?
+       WHERE guild_id = ? AND id = ?`,
+      [n.trigger, n.response, n.responses_json, n.allowed_role_ids, n.fuzzy_enabled, n.similarity_threshold, n.enabled, guildId, id]
+    );
+    res.json({ ok: true });
+  });
+
+  app.delete('/api/guilds/:guildId/auto-replies/:id', async (req, res) => {
+    const guildId = req.params.guildId;
+    const id = parseIntSafe(req.params.id, 0);
+    if (!id) return res.status(400).json({ error: 'invalid_id' });
+    await db.run('DELETE FROM auto_replies WHERE guild_id = ? AND id = ?', [guildId, id]);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/guilds/:guildId/blacklist', async (req, res) => {
+    const guildId = req.params.guildId;
+    const word = String(req.body?.word || '').trim();
+    if (!word) return res.status(400).json({ error: 'word_required' });
+    await db.run('INSERT OR IGNORE INTO automod_blacklist (guild_id, word) VALUES (?, ?)', [guildId, word]);
+    return res.json({ ok: true });
+  });
+
+  app.delete('/api/guilds/:guildId/blacklist/:word', async (req, res) => {
+    const guildId = req.params.guildId;
+    const word = decodeURIComponent(req.params.word);
+    await db.run('DELETE FROM automod_blacklist WHERE guild_id = ? AND word = ?', [guildId, word]);
+    return res.json({ ok: true });
+  });
+
+  app.post('/api/guilds/:guildId/role-levels', async (req, res) => {
+    const guildId = req.params.guildId;
+    const level = parseIntSafe(req.body?.level, 0);
+    const roleId = String(req.body?.role_id || '').trim();
+    if (!level || !roleId) return res.status(400).json({ error: 'level_and_role_required' });
+    await db.run(
+      `INSERT INTO role_levels (guild_id, level, role_id)
+       VALUES (?, ?, ?)
+       ON CONFLICT(guild_id, level) DO UPDATE SET role_id = excluded.role_id`,
+      [guildId, level, roleId]
+    );
+    return res.json({ ok: true });
+  });
+
+  app.delete('/api/guilds/:guildId/role-levels/:level', async (req, res) => {
+    const guildId = req.params.guildId;
+    const level = parseIntSafe(req.params.level, 0);
+    if (!level) return res.status(400).json({ error: 'invalid_level' });
+    await db.run('DELETE FROM role_levels WHERE guild_id = ? AND level = ?', [guildId, level]);
+    return res.json({ ok: true });
+  });
+
+  app.get('/api/guilds/:guildId/credits', async (req, res) => {
+    const guildId = req.params.guildId;
+    const limit = Math.max(1, Math.min(50, parseIntSafe(req.query.limit, 20)));
+    const rows = await db.all(
+      'SELECT user_id, balance FROM credits WHERE guild_id = ? ORDER BY balance DESC LIMIT ?',
+      [guildId, limit]
+    );
+    res.json({ items: rows });
+  });
+
+  app.post('/api/guilds/:guildId/credits/set', async (req, res) => {
+    const guildId = req.params.guildId;
+    const userId = String(req.body?.user_id || '').trim();
+    const balance = parseIntSafe(req.body?.balance, NaN);
+    if (!userId || !Number.isFinite(balance) || balance < 0) {
+      return res.status(400).json({ error: 'invalid_payload' });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    await db.run(
+      'INSERT OR IGNORE INTO credits (guild_id, user_id, balance, daily_next, updated_at) VALUES (?, ?, 0, 0, ?)',
+      [guildId, userId, now]
+    );
+    await db.run(
+      'UPDATE credits SET balance = ?, updated_at = ? WHERE guild_id = ? AND user_id = ?',
+      [balance, now, guildId, userId]
+    );
+    res.json({ ok: true });
+  });
+
+  app.post('/api/guilds/:guildId/credits/add', async (req, res) => {
+    const guildId = req.params.guildId;
+    const userId = String(req.body?.user_id || '').trim();
+    const amount = parseIntSafe(req.body?.amount, NaN);
+    if (!userId || !Number.isFinite(amount)) {
+      return res.status(400).json({ error: 'invalid_payload' });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    await db.run(
+      'INSERT OR IGNORE INTO credits (guild_id, user_id, balance, daily_next, updated_at) VALUES (?, ?, 0, 0, ?)',
+      [guildId, userId, now]
+    );
+    const current = await db.get('SELECT balance FROM credits WHERE guild_id = ? AND user_id = ?', [guildId, userId]);
+    const nextBalance = Math.max(0, (current?.balance || 0) + amount);
+    await db.run(
+      'UPDATE credits SET balance = ?, updated_at = ? WHERE guild_id = ? AND user_id = ?',
+      [nextBalance, now, guildId, userId]
+    );
+    res.json({ ok: true, balance: nextBalance });
+  });
+
+  app.get('/stats', (req, res) => res.redirect('/api/guilds'));
+  app.get('/giveaways', async (req, res) => {
+    const rows = await db.all(
+      'SELECT id, guild_id, prize, ends_at, ended, winners_count FROM giveaways ORDER BY id DESC LIMIT 100'
+    );
+    res.json({ giveaways: rows });
+  });
+  app.use((err, req, res, next) => {
+    console.error('dashboard error:', err);
+    res.status(500).json({ error: 'internal_error' });
+  });
+
+  app.listen(port, '0.0.0.0', () => console.log(`Dashboard listening on ${port}`));
+}
+
+module.exports = { startDashboard };
+
